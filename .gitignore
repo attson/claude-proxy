@@ -1,0 +1,17 @@
+# 编译产物
+/claude-proxy
+/claude-proxy.exe
+/dist/
+*.exe
+
+# IDE
+/.idea/
+*.iml
+
+# 运行期产物(不应进仓库)
+*.log
+*.pid
+/samples/
+
+# OS
+.DS_Store
