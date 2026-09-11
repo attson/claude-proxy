@@ -133,3 +133,48 @@ func tail(s string, n int) string {
 	}
 	return s
 }
+
+// 用真实坏样本 00482 驱动:AskUserQuestion 的 questions 被双重编码,
+// 救援后应还原成合法数组(input_json_delta 里 questions 是 array)。
+func TestRescueInputFixRealSample(t *testing.T) {
+	path := os.ExpandEnv("$HOME/.claude-proxy/samples/20260911-131049-00482.sse")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("样本不存在: %v", err)
+	}
+	body := data
+	if i := strings.IndexByte(string(data), '\n'); strings.HasPrefix(string(data), "# META") {
+		body = data[i+1:]
+	}
+	out := runRescue(t, string(body))
+
+	// 从输出里找 AskUserQuestion 的 input_json_delta,确认 questions 已是数组
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var d map[string]interface{}
+		if json.Unmarshal([]byte(strings.TrimSpace(line[5:])), &d) != nil {
+			continue
+		}
+		delta, _ := d["delta"].(map[string]interface{})
+		pj, ok := delta["partial_json"].(string)
+		if !ok || !strings.Contains(pj, "questions") {
+			continue
+		}
+		var input map[string]interface{}
+		if json.Unmarshal([]byte(pj), &input) != nil {
+			continue
+		}
+		if _, isArr := input["questions"].([]interface{}); isArr {
+			found = true
+		} else {
+			t.Errorf("questions 仍不是数组: %T", input["questions"])
+		}
+	}
+	if !found {
+		t.Fatalf("未在救援输出里找到修复后的 AskUserQuestion input")
+	}
+}

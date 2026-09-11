@@ -91,6 +91,42 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 	var bufText strings.Builder
 	var bufIndex float64
 
+	// 当前正在缓冲的 tool_use block(仅已知会双重编码 input 的工具)
+	var tuBuffering bool
+	var tuName string
+	var tuStartEv []byte // 已 reindex 的 content_block_start 原始字节
+	var tuJSON strings.Builder
+
+	// handleToolStop 处理已知工具的 tool_use block 结束:修 input 后重发。
+	handleToolStop := func(stopEv sseEvent) (ok bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[proxy] tool input fix panic (fail-open): %v", r)
+				// fail-open:补发缓冲的原始 start + delta + stop
+				idx := floatFrom(stopEv.Data, "index") + float64(indexShift)
+				ok = write(tuStartEv) &&
+					writeInputDelta(write, idx, tuJSON.String()) &&
+					write(reindex(stopEv, indexShift))
+				tuBuffering = false
+			}
+		}()
+		raw := []byte(tuJSON.String())
+		fixed, changed := fixToolInput(tuName, raw)
+		startBytes := tuStartEv
+		tuBuffering = false
+		// start/delta/stop 三者 index 必须一致:统一用加过偏移的 index。
+		idx := floatFrom(stopEv.Data, "index") + float64(indexShift)
+		payload := string(raw)
+		if changed {
+			payload = string(fixed)
+			rescued = true
+			auditWrite(auditRecord{Result: "input_fixed", Tool: tuName, Sample: baseName(sw)})
+		}
+		return write(startBytes) &&
+			writeInputDelta(write, idx, payload) &&
+			write(reindex(stopEv, indexShift))
+	}
+
 	flushBufferAsIs := func() bool {
 		for _, e := range bufEvents {
 			if !write(e) {
@@ -163,11 +199,27 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 				bufIndex = floatFrom(ev.Data, "index")
 				return true
 			}
-			// 非 text block:若之前在拆块导致 index 偏移,需改写 index
+			// tool_use 且属于已知会双重编码的工具:缓冲以便修 input
+			if typ == "tool_use" {
+				if name, _ := toolName(ev); knownDoubleEncoded[name] != nil {
+					tuBuffering = true
+					tuName = name
+					tuStartEv = reindex(ev, indexShift)
+					tuJSON.Reset()
+					return true
+				}
+			}
+			// 其它 block:若之前拆块导致 index 偏移,改写 index
 			ok = write(reindex(ev, indexShift))
 			return ok
 
 		case "content_block_delta":
+			if tuBuffering {
+				if pj := deltaPartialJSON(ev); pj != "" {
+					tuJSON.WriteString(pj)
+				}
+				return true // delta 先不发,等 stop 时决定
+			}
 			if buffering {
 				bufEvents = append(bufEvents, ev.Raw)
 				if t := deltaText(ev); t != "" {
@@ -184,6 +236,10 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 			return ok
 
 		case "content_block_stop":
+			if tuBuffering {
+				ok = handleToolStop(ev)
+				return ok
+			}
 			if buffering {
 				bufEvents = append(bufEvents, ev.Raw)
 				ok = handleStop()
@@ -214,6 +270,17 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 	if buffering && len(bufEvents) > 0 {
 		_ = flushBufferAsIs()
 	}
+	// tool_use 缓冲未闭合(异常中断):原样补发 start + delta(不修)
+	if tuBuffering {
+		_ = write(tuStartEv)
+		if tuJSON.Len() > 0 {
+			delta := map[string]interface{}{
+				"type": "content_block_delta", "index": 0.0,
+				"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": tuJSON.String()},
+			}
+			_ = write(formatEvent("content_block_delta", delta))
+		}
+	}
 }
 
 // —— 辅助 ——
@@ -230,6 +297,30 @@ func deltaText(ev sseEvent) string {
 		return t
 	}
 	return ""
+}
+
+func deltaPartialJSON(ev sseEvent) string {
+	d, _ := ev.Data["delta"].(map[string]interface{})
+	if t, ok := d["partial_json"].(string); ok {
+		return t
+	}
+	return ""
+}
+
+func toolName(ev sseEvent) (string, bool) {
+	cb, _ := ev.Data["content_block"].(map[string]interface{})
+	n, ok := cb["name"].(string)
+	return n, ok
+}
+
+// writeInputDelta 用给定 partial_json 合成并写出一个 input_json_delta 事件。
+func writeInputDelta(write func([]byte) bool, index float64, partialJSON string) bool {
+	delta := map[string]interface{}{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": partialJSON},
+	}
+	return write(formatEvent("content_block_delta", delta))
 }
 
 // reindex 若 shift>0,改写事件里的 index 字段后重新序列化;否则原样返回 Raw。
