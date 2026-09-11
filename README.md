@@ -46,6 +46,16 @@ count
 
 可做 alias:`alias cc='~/GolandProjects/claude-proxy/claude-proxy run --'`
 
+### 升级
+
+```bash
+claude-proxy update          # 检查并升级到最新 Release
+claude-proxy update --check  # 只检查有无新版,不下载
+claude-proxy version         # 查看当前版本
+```
+
+从 GitHub Releases 拉取对应平台产物,校验 sha256 后原子替换自身。若本机到 GitHub 下载域受限,可设镜像前缀:`CLAUDE_PROXY_DOWNLOAD_MIRROR=<前缀> claude-proxy update`。
+
 ### 手动启停(可选)
 
 ```bash

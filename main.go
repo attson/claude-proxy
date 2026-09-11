@@ -38,6 +38,14 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Println("claude-proxy", version)
 		return
+	case "update":
+		checkOnly := false
+		for _, a := range os.Args[2:] {
+			if a == "--check" {
+				checkOnly = true
+			}
+		}
+		os.Exit(selfUpdate(checkOnly))
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\nusage: claude-proxy [serve|run -- <claude args>|analyze <file>]\n", sub)
 		os.Exit(2)
