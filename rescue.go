@@ -47,6 +47,22 @@ func computeSplit(text string) (narrative string, ok bool) {
 	return pre, true
 }
 
+// orphanPrefixTail 匹配 text 尾部孤立成行/成尾的退化前缀 count/court:
+// 前面必须是字符串起始或空白/换行,后面到结尾只能是空白。命中返回剥离前缀
+// 及其前置空白后的文本。用于识别「text 尾部残留孤儿前缀 + 后接真 tool_use」形态。
+var orphanPrefixTail = regexp.MustCompile(`(?:^|[\s])(?:count|court)\s*$`)
+
+// stripOrphanPrefixTail 若 text 以孤立的 count/court 结尾,剥掉该前缀及其前导空白,
+// 返回 (剥离后文本, true);否则返回 (原文, false)。
+func stripOrphanPrefixTail(text string) (string, bool) {
+	loc := orphanPrefixTail.FindStringIndex(text)
+	if loc == nil {
+		return text, false
+	}
+	// loc[0] 指向匹配起点(可能是前导空白或字符串起始);剥到该点并去掉尾部空白。
+	return strings.TrimRight(text[:loc[0]], " \n\r\t"), true
+}
+
 // parsePseudoInvoke 从退化文本解析出工具 name 与 input(全部当字符串,值保留原文)。
 func parsePseudoInvoke(text string) (name string, input map[string]string, ok bool) {
 	nm := invokeStart.FindStringSubmatch(text)
@@ -90,6 +106,13 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 	var bufEvents [][]byte // 缓冲的原始事件字节(用于 fail-open 补发)
 	var bufText strings.Builder
 	var bufIndex float64
+
+	// 挂起的「尾部孤儿前缀」text block:text 已结束且尾部含孤立 count/court,
+	// 但还需看下一个 block 是否为 tool_use 才能决定剥离。此时暂不发出。
+	var pendingOrphan bool
+	var pendingOrphanText string // 已剥离尾部前缀后的叙述文字
+	var pendingOrphanRaw string  // 原始文字(含前缀),用于「下一个不是 tool_use」时回退
+	var pendingOrphanIndex int   // 该 text block 的原始 index
 
 	// 当前正在缓冲的 tool_use block(仅已知会双重编码 input 的工具)
 	var tuBuffering bool
@@ -150,6 +173,18 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 		}()
 		full := bufText.String()
 		if !degradeText(full) {
+			// 无 <invoke> XML,但可能是「尾部孤儿前缀 + 后接真 tool_use」形态:
+			// 挂起等待下一个 block 判定,不立即 flush。
+			if stripped, matched := stripOrphanPrefixTail(full); matched {
+				pendingOrphan = true
+				pendingOrphanText = stripped
+				pendingOrphanRaw = full
+				pendingOrphanIndex = int(bufIndex)
+				buffering = false
+				bufEvents = nil
+				bufText.Reset()
+				return true
+			}
 			return flushBufferAsIs() // 非退化,原样补发
 		}
 		narrative, ok := computeSplit(full)
@@ -183,10 +218,40 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 		return true
 	}
 
+	// settleOrphan 结算挂起的孤儿前缀 text block。nextIsToolUse=true 表示紧跟
+	// 一个 tool_use(剥离生效,发剥离后叙述);否则回退发原文(剥离作废)。
+	settleOrphan := func(nextIsToolUse bool) bool {
+		pendingOrphan = false
+		text := pendingOrphanRaw
+		if nextIsToolUse {
+			text = pendingOrphanText
+			rescued = true
+			auditWrite(auditRecord{Result: "orphan_stripped", BlockIndex: pendingOrphanIndex, Sample: baseName(sw)})
+		}
+		if strings.TrimSpace(text) == "" {
+			return true // 剥离后为空:整个 text block 丢弃,无需发出
+		}
+		return emitTextBlock(write, pendingOrphanIndex, text)
+	}
+
 	ok := true
 	iterEvents(reader, func(ev sseEvent) bool {
 		if !ok {
 			return false
+		}
+		// 有挂起的孤儿前缀 text block:任何后续事件到来先结算它。
+		// 仅当紧跟的是 tool_use 的 content_block_start 才剥离生效。
+		if pendingOrphan {
+			nextIsToolUse := false
+			if ev.Event == "content_block_start" {
+				if typ, _ := blockType(ev); typ == "tool_use" {
+					nextIsToolUse = true
+				}
+			}
+			if !settleOrphan(nextIsToolUse) {
+				ok = false
+				return false
+			}
 		}
 		switch ev.Event {
 		case "content_block_start":
@@ -269,6 +334,10 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 	// 流结束时若仍有未 flush 的缓冲(异常中断),补发
 	if buffering && len(bufEvents) > 0 {
 		_ = flushBufferAsIs()
+	}
+	// 挂起的孤儿前缀未结算(异常中断:后面没有任何事件):回退发原文,不剥离。
+	if pendingOrphan {
+		_ = settleOrphan(false)
 	}
 	// tool_use 缓冲未闭合(异常中断):原样补发 start + delta(不修)
 	if tuBuffering {
