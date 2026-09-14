@@ -39,7 +39,11 @@ var sniffInvoke = regexp.MustCompile(`<invoke\s+name=`)
 // buildProxy 构造一个反向代理:透传一切,只在上游响应是 text/event-stream 时
 // 进入 SSE 拦截(落盘样本 + 阶段二救援)。任何异常一律 fail-open。
 func buildProxy(cfg *Config) *httputil.ReverseProxy {
-	target := &url.URL{Scheme: cfg.UpstreamScheme, Host: cfg.UpstreamHost}
+	// 上游解析失败时兜底官方端,保证代理仍可用(不 panic)。
+	target, err := cfg.upstreamURL()
+	if err != nil {
+		target = &url.URL{Scheme: "https", Host: "api.anthropic.com"}
+	}
 
 	rp := &httputil.ReverseProxy{
 		// FlushInterval=-1:每次 Write 立即 flush,SSE 流不被缓冲。
@@ -48,6 +52,10 @@ func buildProxy(cfg *Config) *httputil.ReverseProxy {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host // 重置 Host 为上游
+			// 上游若有路径前缀(如 https://host/base),拼到 CLI 原路径前。
+			if target.Path != "" {
+				req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
+			}
 			// 降级 Accept-Encoding:永不放行 br(避免任何解压麻烦);
 			// Go transport 会在此值为空时自动加 gzip 并自动解压。
 			req.Header.Set("Accept-Encoding", "identity")
@@ -60,6 +68,19 @@ func buildProxy(cfg *Config) *httputil.ReverseProxy {
 		},
 	}
 	return rp
+}
+
+// singleJoiningSlash 拼接两段路径,恰好保证中间只有一个斜杠(取自 httputil)。
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }
 
 func modifyResponse(cfg *Config) func(*http.Response) error {

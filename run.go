@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -20,6 +21,20 @@ import (
 // 参考 claude-tap 的 reverse 模式:明文 HTTP 反代 + --settings 优先级绕过。
 func runClaude(cfg *Config, claudeArgs []string) int {
 	baseURL := fmt.Sprintf("http://%s:%d", cfg.ListenHost, cfg.Port)
+
+	// 0. 确定真实上游:优先显式 CLAUDE_PROXY_UPSTREAM,否则读 ~/.claude/settings.json
+	//    的 env.ANTHROPIC_BASE_URL,否则用 cfg 默认。写回 cfg 供 spawnProxy 透传。
+	if os.Getenv("CLAUDE_PROXY_UPSTREAM") == "" {
+		if up := readSettingsBaseURL(); up != "" {
+			cfg.Upstream = up
+		}
+	}
+	// 自指前置检查:避免后台 serve 起来又 fatal 退出、run 侧只看到超时。
+	if cfg.isSelfReference() {
+		fmt.Fprintf(os.Stderr, "[run] 上游 %s 指向代理自己,会死循环。请把 ~/.claude/settings.json 的 "+
+			"ANTHROPIC_BASE_URL 改为真实上游(如 https://api.anthropic.com)\n", cfg.Upstream)
+		return 1
+	}
 
 	// 1. 确保代理在跑
 	if err := ensureProxy(cfg, baseURL); err != nil {
@@ -137,7 +152,8 @@ func spawnProxy(cfg *Config) (int, error) {
 		return 0, err
 	}
 	proc := exec.Command(self, "serve")
-	proc.Env = append(os.Environ(), "CLAUDE_PROXY_RESCUE=1")
+	// 把 run 确定的上游透传给后台 serve(它会经 loadConfig 的 CLAUDE_PROXY_UPSTREAM 读到)。
+	proc.Env = append(os.Environ(), "CLAUDE_PROXY_RESCUE=1", "CLAUDE_PROXY_UPSTREAM="+cfg.Upstream)
 	proc.Stdout = logf
 	proc.Stderr = logf
 	proc.Stdin = nil
@@ -152,6 +168,26 @@ func spawnProxy(cfg *Config) (int, error) {
 	// 覆盖了在跑代理的 pidfile"。这里只 Release 让它脱离父进程。
 	_ = proc.Process.Release()
 	return pid, nil
+}
+
+// readSettingsBaseURL 读 ~/.claude/settings.json 的 env.ANTHROPIC_BASE_URL。
+// 文件缺失/无该键/解析失败一律返回 ""(由调用方回退默认)。不 log 文件内容(含 token)。
+func readSettingsBaseURL() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		return ""
+	}
+	var s struct {
+		Env map[string]string `json:"env"`
+	}
+	if json.Unmarshal(data, &s) != nil {
+		return ""
+	}
+	return s.Env["ANTHROPIC_BASE_URL"]
 }
 
 func hasSettingsArg(args []string) bool {

@@ -86,11 +86,17 @@ func serve(cfg *Config) {
 	// 端口已拿下:写 pidfile。
 	_ = os.WriteFile(cfg.PidFile, []byte(strconv.Itoa(os.Getpid())), 0o600)
 
+	// 自指检测:上游若指向代理自己(回环+同端口),转发会死循环,拒绝启动。
+	if cfg.isSelfReference() {
+		log.Fatalf("[proxy] 上游 %s 指向代理自己,会死循环。请把 ~/.claude/settings.json 的 "+
+			"ANTHROPIC_BASE_URL 改为真实上游,或设 CLAUDE_PROXY_UPSTREAM", cfg.Upstream)
+	}
+
 	// 健康自检(不阻断启动)。
 	if err := healthCheck(cfg); err != nil {
 		log.Printf("[proxy] WARNING upstream health check failed: %v (starting anyway)", err)
 	} else {
-		log.Printf("[proxy] upstream %s reachable", cfg.UpstreamHost)
+		log.Printf("[proxy] upstream %s reachable", cfg.Upstream)
 	}
 
 	proxy := buildProxy(cfg)
@@ -99,8 +105,8 @@ func serve(cfg *Config) {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	log.Printf("[proxy] claude-proxy %s listening on http://%s  ->  %s://%s",
-		version, addr, cfg.UpstreamScheme, cfg.UpstreamHost)
+	log.Printf("[proxy] claude-proxy %s listening on http://%s  ->  %s",
+		version, addr, cfg.Upstream)
 	log.Printf("[proxy] passthrough_only=%v sample=%v rescue=%v redact=%v",
 		cfg.PassthroughOnly, cfg.SampleEnabled, cfg.RescueEnabled, cfg.RedactEnabled)
 	if cfg.SampleEnabled && !cfg.RedactEnabled {
@@ -118,12 +124,16 @@ func isAddrInUse(err error) bool {
 		strings.Contains(err.Error(), "address already in use")
 }
 
-// healthCheck 对上游 443 做一次 TCP 连通性探测(不发 HTTP,避免消耗配额)。
+// healthCheck 对上游做一次 TCP 连通性探测(不发 HTTP,避免消耗配额)。
 func healthCheck(cfg *Config) error {
+	addr, err := cfg.upstreamDialAddr()
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", cfg.UpstreamHost+":443")
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // 配置集中于此。多数项可用环境变量覆盖,改完重启代理生效。
@@ -11,10 +14,11 @@ type Config struct {
 	ListenHost string
 	Port       int
 
-	// 真实上游(Claude Code 原本直连的网关)。回退时把 settings.json 的
-	// ANTHROPIC_BASE_URL 改回 https://<UpstreamHost>/ 即彻底绕开代理。
-	UpstreamScheme string
-	UpstreamHost   string
+	// 真实上游 base URL(完整,含 scheme,可含端口/路径前缀)。
+	// 来源优先级:环境变量 CLAUDE_PROXY_UPSTREAM > run 从 ~/.claude/settings.json
+	// 读到的 ANTHROPIC_BASE_URL > 默认 https://api.anthropic.com。
+	// run 子命令读 settings 后经 CLAUDE_PROXY_UPSTREAM 传给后台 serve 进程。
+	Upstream string
 
 	// 阶段开关:
 	//   PassthroughOnly=true  纯转发,不进 SSE 拦截(最保守,回退用)。
@@ -40,8 +44,7 @@ func loadConfig() *Config {
 	return &Config{
 		ListenHost:      "127.0.0.1",
 		Port:            envInt("CLAUDE_PROXY_PORT", 36240),
-		UpstreamScheme:  "https",
-		UpstreamHost:    envStr("CLAUDE_PROXY_UPSTREAM", "api.anthropic.com"),
+		Upstream:        envStr("CLAUDE_PROXY_UPSTREAM", "https://api.anthropic.com"),
 		PassthroughOnly: envBool("CLAUDE_PROXY_PASSTHROUGH", false),
 		SampleEnabled:   envBool("CLAUDE_PROXY_SAMPLE", true),
 		RescueEnabled:   envBool("CLAUDE_PROXY_RESCUE", false),
@@ -74,4 +77,53 @@ func envBool(k string, def bool) bool {
 		return v == "1" || v == "true"
 	}
 	return def
+}
+
+// upstreamURL 解析上游 base URL。路径尾斜杠归一化(去掉),避免转发拼出 //v1/...。
+func (c *Config) upstreamURL() (*url.URL, error) {
+	u, err := url.Parse(c.Upstream)
+	if err != nil {
+		return nil, err
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u, nil
+}
+
+// upstreamDialAddr 返回用于 TCP 健康探测的 host:port(按 scheme 补默认端口)。
+func (c *Config) upstreamDialAddr() (string, error) {
+	u, err := c.upstreamURL()
+	if err != nil {
+		return "", err
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "http" {
+			port = "80"
+		} else {
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// isSelfReference 判断上游是否指向代理自己(回环地址 + 同端口),防死循环。
+func (c *Config) isSelfReference() bool {
+	u, err := c.upstreamURL()
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		host = "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		return false // 回环但无端口,不太可能是本代理
+	}
+	return port == strconv.Itoa(c.Port)
 }

@@ -9,4 +9,4 @@ if [[ -f "$PID" ]] && kill -0 "$(cat "$PID")" 2>/dev/null; then
 else
   echo "未在运行(无有效 pidfile)"
 fi
-echo "回退提醒: 记得把 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL 改回 https://api.anthropic.com/ 并重启 Claude Code"
+echo "提示: 用 'claude-proxy run -- ...' 启动 claude 会自动拉起代理,无需手动改 settings.json"
