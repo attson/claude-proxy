@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 停止 claude-proxy(按 pidfile)。
+# 停止 claude-proxy(按 pidfile)。pidfile 带端口,与 Go 侧命名一致。
 set -euo pipefail
-PID="$HOME/.claude-proxy/proxy.pid"
+PORT="${CLAUDE_PROXY_PORT:-36240}"
+PID="$HOME/.claude-proxy/proxy-${PORT}.pid"
 if [[ -f "$PID" ]] && kill -0 "$(cat "$PID")" 2>/dev/null; then
   kill "$(cat "$PID")"
   echo "已停止 pid=$(cat "$PID")"

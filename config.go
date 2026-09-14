@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -41,9 +42,10 @@ type Config struct {
 func loadConfig() *Config {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".claude-proxy")
+	port := envInt("CLAUDE_PROXY_PORT", 36240)
 	return &Config{
 		ListenHost:      "127.0.0.1",
-		Port:            envInt("CLAUDE_PROXY_PORT", 36240),
+		Port:            port,
 		Upstream:        envStr("CLAUDE_PROXY_UPSTREAM", "https://api.anthropic.com"),
 		PassthroughOnly: envBool("CLAUDE_PROXY_PASSTHROUGH", false),
 		SampleEnabled:   envBool("CLAUDE_PROXY_SAMPLE", true),
@@ -52,7 +54,9 @@ func loadConfig() *Config {
 		SampleDir:       filepath.Join(base, "samples"),
 		SampleKeep:      envInt("CLAUDE_PROXY_SAMPLE_KEEP", 200),
 		LogFile:         filepath.Join(base, "proxy.log"),
-		PidFile:         filepath.Join(base, "proxy.pid"),
+		// pidfile 带端口:不同端口的实例各写各的,避免换端口起的实例(如冒烟
+		// 测试)覆盖掉默认实例的 pidfile,进而害得 stop 杀错/杀空。
+		PidFile: filepath.Join(base, fmt.Sprintf("proxy-%d.pid", port)),
 	}
 }
 
