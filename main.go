@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -60,14 +63,30 @@ func claudeArgsFrom(args []string) []string {
 	return args
 }
 
+// exitPortInUse 是端口被占用时的退出码,供 run 快速识别"已有代理在跑"。
+const exitPortInUse = 3
+
 // serve 启动 SSE 反向代理并阻塞监听。
 func serve(cfg *Config) {
 	initAudit(cfg)
 
-	// 写 pidfile(供 stop.sh 用)。
+	addr := fmt.Sprintf("%s:%d", cfg.ListenHost, cfg.Port)
+
+	// 先抢占端口:成功后才写 pidfile、打 listening 日志,避免"已宣告 listening
+	// 却因端口占用秒退"的误导,也避免覆盖别人的 pidfile。
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		if isAddrInUse(err) {
+			log.Printf("[proxy] 端口 %s 已被占用(可能已有代理在跑),退出", addr)
+			os.Exit(exitPortInUse)
+		}
+		log.Fatalf("[proxy] 无法监听 %s: %v", addr, err)
+	}
+
+	// 端口已拿下:写 pidfile。
 	_ = os.WriteFile(cfg.PidFile, []byte(strconv.Itoa(os.Getpid())), 0o600)
 
-	// 启动前健康自检:对上游做一次连通性探测。
+	// 健康自检(不阻断启动)。
 	if err := healthCheck(cfg); err != nil {
 		log.Printf("[proxy] WARNING upstream health check failed: %v (starting anyway)", err)
 	} else {
@@ -75,11 +94,8 @@ func serve(cfg *Config) {
 	}
 
 	proxy := buildProxy(cfg)
-	addr := fmt.Sprintf("%s:%d", cfg.ListenHost, cfg.Port)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: proxy,
-		// 流式长连接:不设写超时,读头超时给足。
+		Handler:           proxy,
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
@@ -90,11 +106,16 @@ func serve(cfg *Config) {
 	if cfg.SampleEnabled && !cfg.RedactEnabled {
 		log.Printf("[proxy] WARNING 脱敏已关闭(CLAUDE_PROXY_REDACT=0):样本将含 token 明文,请确保磁盘安全")
 	}
-	log.Printf("[proxy] 接入: 把 ~/.claude/settings.json 的 ANTHROPIC_BASE_URL 改为 http://%s 并重启 Claude Code", addr)
 
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.Serve(ln); err != nil {
 		log.Fatalf("[proxy] server exited: %v", err)
 	}
+}
+
+// isAddrInUse 判断错误是否为"地址已被占用"。
+func isAddrInUse(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) ||
+		strings.Contains(err.Error(), "address already in use")
 }
 
 // healthCheck 对上游 443 做一次 TCP 连通性探测(不发 HTTP,避免消耗配额)。

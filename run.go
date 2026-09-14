@@ -22,19 +22,9 @@ func runClaude(cfg *Config, claudeArgs []string) int {
 	baseURL := fmt.Sprintf("http://%s:%d", cfg.ListenHost, cfg.Port)
 
 	// 1. 确保代理在跑
-	if !proxyListening(cfg) {
-		fmt.Fprintf(os.Stderr, "[run] 代理未运行,后台拉起 %s ...\n", baseURL)
-		if err := spawnProxy(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "[run] 拉起代理失败: %v\n", err)
-			return 1
-		}
-		if !waitListening(cfg, 5*time.Second) {
-			fmt.Fprintf(os.Stderr, "[run] 代理未能就绪,看 %s\n", cfg.LogFile)
-			return 1
-		}
-		fmt.Fprintf(os.Stderr, "[run] 代理已就绪\n")
-	} else {
-		fmt.Fprintf(os.Stderr, "[run] 复用已在运行的代理 %s\n", baseURL)
+	if err := ensureProxy(cfg, baseURL); err != nil {
+		fmt.Fprintf(os.Stderr, "[run] %v\n", err)
+		return 1
 	}
 
 	// 2. 组装 env
@@ -100,26 +90,51 @@ func proxyListening(cfg *Config) bool {
 	return true
 }
 
-func waitListening(cfg *Config, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+// ensureProxy 确保本地代理在监听:已在跑则复用;否则后台拉起并等待就绪。
+// 处理竞态:若拉起的进程因端口被抢占而秒退,则说明已有别的代理在跑,复用之。
+func ensureProxy(cfg *Config, baseURL string) error {
+	if proxyListening(cfg) {
+		fmt.Fprintf(os.Stderr, "[run] 复用已在运行的代理 %s\n", baseURL)
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "[run] 代理未运行,后台拉起 %s ...\n", baseURL)
+	pid, err := spawnProxy(cfg)
+	if err != nil {
+		return fmt.Errorf("拉起代理失败: %v", err)
+	}
+
+	// 轮询就绪:端口起来了 => 成功;子进程已消失且端口仍不通 => 秒退失败。
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if proxyListening(cfg) {
-			return true
+			fmt.Fprintf(os.Stderr, "[run] 代理已就绪\n")
+			return nil
+		}
+		if !pidAlive(pid) {
+			// 子进程退出了。可能是端口被别人抢占(秒退)——若此刻端口通,复用;
+			// 否则给 100ms 让端口真正 up 后再判失败。
+			time.Sleep(150 * time.Millisecond)
+			if proxyListening(cfg) {
+				fmt.Fprintf(os.Stderr, "[run] 复用已在运行的代理 %s\n", baseURL)
+				return nil
+			}
+			return fmt.Errorf("代理启动后立即退出(可能端口 %d 被非代理进程占用),看 %s", cfg.Port, cfg.LogFile)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return false
+	return fmt.Errorf("代理未能在 5s 内就绪,看 %s", cfg.LogFile)
 }
 
-// spawnProxy 后台拉起一个自身作代理进程(serve 模式,开启救援)。
-func spawnProxy(cfg *Config) error {
+// spawnProxy 后台拉起一个自身作代理进程(serve 模式,开启救援),返回其 pid。
+func spawnProxy(cfg *Config) (int, error) {
 	self, err := os.Executable()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	logf, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	proc := exec.Command(self, "serve")
 	proc.Env = append(os.Environ(), "CLAUDE_PROXY_RESCUE=1")
@@ -130,11 +145,13 @@ func spawnProxy(cfg *Config) error {
 	proc.SysProcAttr = detachSysProcAttr()
 	if err := proc.Start(); err != nil {
 		_ = logf.Close()
-		return err
+		return 0, err
 	}
-	_ = os.WriteFile(cfg.PidFile, []byte(fmt.Sprintf("%d", proc.Process.Pid)), 0o600)
+	pid := proc.Process.Pid
+	// 注意:不写 pidfile —— pidfile 由 serve 抢到端口后自己写,避免"秒退进程
+	// 覆盖了在跑代理的 pidfile"。这里只 Release 让它脱离父进程。
 	_ = proc.Process.Release()
-	return nil
+	return pid, nil
 }
 
 func hasSettingsArg(args []string) bool {

@@ -17,3 +17,13 @@ func detachSysProcAttr() *syscall.SysProcAttr {
 func forwardedSignals() []os.Signal {
 	return []os.Signal{syscall.SIGINT, syscall.SIGTERM}
 }
+
+// pidAlive:Windows 上 os.FindProcess 仅在进程存在时成功。
+func pidAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	_ = proc.Release()
+	return true
+}

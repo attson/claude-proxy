@@ -16,3 +16,12 @@ func detachSysProcAttr() *syscall.SysProcAttr {
 func forwardedSignals() []os.Signal {
 	return []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT}
 }
+
+// pidAlive 用信号 0 探测进程是否存活。
+func pidAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
