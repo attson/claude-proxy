@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GO="${GO_BIN:-$HOME/sdk/go1.23.12/bin/go}"
 PORT="${CLAUDE_PROXY_PORT:-36240}"
 LOG="$HOME/.claude-proxy/proxy.log"
-PID="$HOME/.claude-proxy/proxy.pid"
+PID="$HOME/.claude-proxy/proxy-${PORT}.pid"
 
 mkdir -p "$HOME/.claude-proxy/samples"
 chmod 700 "$HOME/.claude-proxy" "$HOME/.claude-proxy/samples"
