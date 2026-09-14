@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"log"
 	"net/http"
@@ -59,6 +60,23 @@ func buildProxy(cfg *Config) *httputil.ReverseProxy {
 			// 降级 Accept-Encoding:永不放行 br(避免任何解压麻烦);
 			// Go transport 会在此值为空时自动加 gzip 并自动解压。
 			req.Header.Set("Accept-Encoding", "identity")
+			// 补 GetBody:CLI 请求体是不可重放的流,一旦上游 h2 返回
+			// PROTOCOL_ERROR 这类幂等错误,Go transport 本可自动重试,却因
+			// body 已写出且无 GetBody 而放弃(报 "cannot retry ... after
+			// Request.Body was written")→ 被放大成 502。这里把 body 缓冲进
+			// 内存并提供可重放的 GetBody,让一次上游抖动自愈而非透传成失败。
+			// 代价:请求体整体驻留内存(Claude 请求体为有界 JSON,可接受)。
+			// 缓冲失败一律 fail-open:保持原 body 不变,退回旧行为。
+			if req.Body != nil && req.GetBody == nil {
+				if body, err := io.ReadAll(req.Body); err == nil {
+					_ = req.Body.Close()
+					req.Body = io.NopCloser(bytes.NewReader(body))
+					req.ContentLength = int64(len(body))
+					req.GetBody = func() (io.ReadCloser, error) {
+						return io.NopCloser(bytes.NewReader(body)), nil
+					}
+				}
+			}
 		},
 		ModifyResponse: modifyResponse(cfg),
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
