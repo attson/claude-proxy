@@ -63,6 +63,76 @@ func stripOrphanPrefixTail(text string) (string, bool) {
 	return strings.TrimRight(text[:loc[0]], " \n\r\t"), true
 }
 
+// —— 刷屏式退化短句尾巴(spam tail)——
+// 另一种退化形态:text block 尾部刷屏式连吐几十段极短祈使句
+// (court read. / Grep. / Read. / Let me actually read.),后接一个结构完整的真
+// tool_use。无 <invoke> XML,尾部也非单个孤立 count/court,前三条救援路径都够不着。
+// 结构锚点:后接真 tool_use(见 settleOrphan 的 nextIsToolUse 门控),剥错不破坏工具调用。
+
+const (
+	spamTailMinSegs       = 6  // 尾部连续退化短句(整体)达到此段数即判刷屏
+	spamTailMinPrefixSegs = 3  // 尾部连续退化段中 court/count 前缀段达到此数即判刷屏(强信号,降阈值)
+	spamTailMaxSegLen     = 40 // 关键词「含」式短句单段(rune 计)上限
+	spamImperativeMaxLen  = 64 // 祈使句「开头」式单段(rune 计)上限(略放宽,容纳 "I'll read the ... CSS.")
+)
+
+// spamPrefixRe 强退化信号:段以 count/court 前缀开头(不限长度,前缀本身即铁证)。
+var spamPrefixRe = regexp.MustCompile(`(?i)^(?:count|court)`)
+
+// spamImperativeStartRe 祈使句退化信号(以祈使词开头):Grep./Read./Run./Build./
+// Reading./Running./Let me .../I'll .../I read .../I run .../Enough .../Now grep. 等。
+// 配合 spamImperativeMaxLen 限长,容纳略长的刷屏变体如 "I'll read the ... CSS."。
+var spamImperativeStartRe = regexp.MustCompile(`(?i)^(?:grep|read|run|build|running|reading|let me|i'll|i read|i run|now |enough)\b`)
+
+// spamImperativeHasRe 更严格的「含关键词」退化信号,只用于极短段(<= spamTailMaxSegLen),
+// 兜住 "Grep now." / "Read it." 这类祈使词不在句首的极短变体。
+var spamImperativeHasRe = regexp.MustCompile(`(?i)\b(?:grep|read|run|build|running|reading)\b`)
+
+// isSpamSeg 判定单段是否为退化短句。prefix 表示是否为 court/count 前缀段(强信号)。
+func isSpamSeg(s string) (spam, prefix bool) {
+	if spamPrefixRe.MatchString(s) {
+		return true, true
+	}
+	n := len([]rune(s))
+	if n <= spamImperativeMaxLen && spamImperativeStartRe.MatchString(s) {
+		return true, false
+	}
+	if n <= spamTailMaxSegLen && spamImperativeHasRe.MatchString(s) {
+		return true, false
+	}
+	return false, false
+}
+
+// detectSpamTail 判断 text 尾部是否为刷屏式退化短句序列。
+// 命中返回切点前的正常叙述(TrimRight 空白后)与 true;否则返回原文与 false。
+// 判据:按 \n\n 切段,从末段起向前数连续「退化短句」;整体段数 >= spamTailMinSegs,
+// 或其中 court/count 前缀段数 >= spamTailMinPrefixSegs(强信号降阈值),二者任一即命中。
+func detectSpamTail(text string) (narrative string, matched bool) {
+	segs := strings.Split(text, "\n\n")
+	// 从末尾向前数连续命中的退化短句段,并单独计 court/count 前缀段数
+	run, prefixRun := 0, 0
+	for i := len(segs) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(segs[i])
+		if s == "" {
+			continue // 空段跳过,不打断连续性
+		}
+		spam, prefix := isSpamSeg(s)
+		if !spam {
+			break
+		}
+		run++
+		if prefix {
+			prefixRun++
+		}
+	}
+	if run < spamTailMinSegs && prefixRun < spamTailMinPrefixSegs {
+		return text, false
+	}
+	// 切点:保留前 len(segs)-run 段作为正常叙述
+	pre := strings.Join(segs[:len(segs)-run], "\n\n")
+	return strings.TrimRight(pre, " \n\r\t"), true
+}
+
 // parsePseudoInvoke 从退化文本解析出工具 name 与 input(全部当字符串,值保留原文)。
 func parsePseudoInvoke(text string) (name string, input map[string]string, ok bool) {
 	nm := invokeStart.FindStringSubmatch(text)
@@ -178,6 +248,17 @@ func rescueStream(cfg *Config, sw *sampleWriter, reader *bufio.Reader, out *io.P
 			if stripped, matched := stripOrphanPrefixTail(full); matched {
 				pendingOrphan = true
 				pendingOrphanText = stripped
+				pendingOrphanRaw = full
+				pendingOrphanIndex = int(bufIndex)
+				buffering = false
+				bufEvents = nil
+				bufText.Reset()
+				return true
+			}
+			// 「刷屏式退化短句尾巴 + 后接真 tool_use」形态:同样挂起等下一个 block 判定。
+			if narrative, matched := detectSpamTail(full); matched {
+				pendingOrphan = true
+				pendingOrphanText = narrative
 				pendingOrphanRaw = full
 				pendingOrphanIndex = int(bufIndex)
 				buffering = false
