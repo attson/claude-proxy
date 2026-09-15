@@ -23,37 +23,49 @@ func runRescue(t *testing.T, input string) string {
 	return string(out)
 }
 
-// 用真实退化样本 00136 驱动,验证重组出正确的 tool_use。
-func TestRescueRealSample(t *testing.T) {
-	path := os.ExpandEnv("$HOME/.claude-proxy/samples/20260911-111751-00136.sse")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Skipf("样本不存在,跳过: %v", err)
-	}
-	// 去掉 # META 首行
-	body := data
-	if i := strings.IndexByte(string(data), '\n'); strings.HasPrefix(string(data), "# META") {
-		body = data[i+1:]
-	}
-	out := runRescue(t, string(body))
+// textToolStopEvents 把「一个 text block(单个 delta)+ 收尾 message_delta」包装成 SSE 事件流。
+// stopReason 为上游最终 stop_reason。用于构造退化样本,数据源保真但不依赖易失的采样文件。
+func textBlockSSE(text, stopReason string) string {
+	return strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + jsonStr(text) + `}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":` + jsonStr(stopReason) + `}}`,
+		``,
+		``,
+	}, "\n")
+}
 
-	// 断言:输出里出现合成的 tool_use name=Bash
+// 构造退化样本(形态取自 trace 历史真实响应):text block 内含叙述 + 孤儿 court + 伪 <invoke> XML,
+// 无独立 tool_use。期望:救援重组出合成 tool_use(Bash),叙述保留,command 还原,stop_reason 改为 tool_use。
+func TestRescueXMLInvoke(t *testing.T) {
+	// 退化文本结构照搬真实现场:叙述段 + 孤儿 court 换行 + <invoke name="Bash"> XML。
+	text := "**Task 8**:同步 lockfile。\n\ncourt\n" +
+		`<invoke name="Bash">` + "\n" +
+		`<parameter name="command">SDD_SKILL=1 pnpm install 2>&1 | tail -20</parameter>` + "\n" +
+		`<parameter name="description">pnpm install 同步依赖</parameter>` + "\n" +
+		`</invoke>`
+	out := runRescue(t, textBlockSSE(text, "end_turn"))
+
 	if !strings.Contains(out, `"type":"tool_use"`) || !strings.Contains(out, `"name":"Bash"`) {
 		t.Fatalf("未合成 tool_use Bash block\n输出片段:\n%s", tail(out, 800))
 	}
-	// 断言:stop_reason 被改成 tool_use
 	if !strings.Contains(out, `"stop_reason":"tool_use"`) {
 		t.Errorf("stop_reason 未改成 tool_use")
 	}
-	// 断言:command 参数还原(含 SDD_SKILL 片段)
 	if !strings.Contains(out, "SDD_SKILL=") {
 		t.Errorf("command 参数未正确还原")
 	}
-	// 断言:叙述文字保留(Task 8)
 	if !strings.Contains(out, "Task 8") {
 		t.Errorf("叙述文字未保留")
 	}
-	// 断言:partial_json 是合法 JSON(能解析回 map)
 	assertPartialJSONValid(t, out)
 }
 
@@ -155,40 +167,46 @@ func TestRescueOrphanPrefixBeforeToolUse(t *testing.T) {
 	}
 }
 
-// 用真实样本 00072 驱动:text block 内容纯为 "court"(叙述为空),紧跟完整 AskUserQuestion。
-// 期望:整个孤儿 text block 丢弃(剥完为空),AskUserQuestion 原样透传。
-func TestRescueOrphanPrefixRealSample(t *testing.T) {
-	path := os.ExpandEnv("$HOME/.claude-proxy/samples/20260914-111529-00072.sse")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Skipf("样本不存在,跳过: %v", err)
-	}
-	body := data
-	if i := strings.IndexByte(string(data), '\n'); strings.HasPrefix(string(data), "# META") {
-		body = data[i+1:]
-	}
-	out := runRescue(t, string(body))
+// 构造退化样本:text block 内容纯为孤儿 "court"(叙述为空),紧跟完整 AskUserQuestion tool_use。
+// 期望:整个孤儿 text block 丢弃(剥完为空),AskUserQuestion 原样透传、id 不变。
+func TestRescueOrphanPrefixBeforeAsk(t *testing.T) {
+	const askID = "toolu_01PAE9uHNHXc1cy3CFerMiz8"
+	input := strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"court"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"` + askID + `","name":"AskUserQuestion","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"questions\":[]}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+		``,
+		``,
+	}, "\n")
+	out := runRescue(t, input)
 
 	// 孤儿 court 不应作为 text_delta 泄漏出去
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		var d map[string]interface{}
-		if json.Unmarshal([]byte(strings.TrimSpace(line[5:])), &d) != nil {
-			continue
-		}
-		delta, _ := d["delta"].(map[string]interface{})
-		if txt, ok := delta["text"].(string); ok && strings.TrimSpace(txt) == "court" {
-			t.Errorf("孤儿 court text_delta 泄漏\n%s", line)
+	for _, txt := range textDeltas(out) {
+		if strings.TrimSpace(txt) == "court" {
+			t.Errorf("孤儿 court text_delta 泄漏: %q", txt)
 		}
 	}
-	// AskUserQuestion 原样透传
 	if !strings.Contains(out, "AskUserQuestion") {
 		t.Errorf("AskUserQuestion tool_use 丢失\n%s", tail(out, 400))
 	}
-	if !strings.Contains(out, "toolu_01PAE9uHNHXc1cy3CFerMiz8") {
+	if !strings.Contains(out, askID) {
 		t.Errorf("AskUserQuestion 原 id 被改\n%s", tail(out, 400))
 	}
 }
@@ -272,19 +290,245 @@ func tail(s string, n int) string {
 	return s
 }
 
-// 用真实坏样本 00482 驱动:AskUserQuestion 的 questions 被双重编码,
-// 救援后应还原成合法数组(input_json_delta 里 questions 是 array)。
-func TestRescueInputFixRealSample(t *testing.T) {
-	path := os.ExpandEnv("$HOME/.claude-proxy/samples/20260911-131049-00482.sse")
-	data, err := os.ReadFile(path)
+// —— 刷屏式退化短句尾巴(spam tail)——
+
+// spamSeg 构造 n 段以 \n\n 分隔的刷屏退化短句(court/Grep./Read. 循环),用于测试。
+func spamSeg(n int) string {
+	segs := []string{"court read.", "Read.", "court grep.", "Grep.", "Let me read.", "I'll read."}
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(segs[i%len(segs)])
+	}
+	return b.String()
+}
+
+// TestDetectSpamTail 判据单元测试:正例识别刷屏尾巴并切出正常叙述,反例不误伤。
+func TestDetectSpamTail(t *testing.T) {
+	narrative := "先看 MyMRPanel.vue 现在的行渲染模板（单行卡那段）。"
+	cases := []struct {
+		name    string
+		in      string
+		matched bool
+		want    string // matched 时期望切出的叙述(TrimRight 后)
+	}{
+		{"刷屏尾巴+正常叙述", narrative + "\n\n" + spamSeg(20), true, narrative},
+		{"纯刷屏无叙述", spamSeg(12), true, ""},
+		{"恰好阈值段数", narrative + "\n\n" + spamSeg(spamTailMinSegs), true, narrative},
+		// 反例:防误伤
+		{"少量提及court非刷屏", "网球场地英文是 court，这是正常讨论。", false, ""},
+		{"不足阈值的短句", narrative + "\n\ncourt read.\n\nRead.", false, ""},
+		{"分点长句回答", "第一点是这样一个较长的完整句子用于占位说明。\n\n第二点也是一个足够长的完整句子避免被判成短句。\n\n第三点同样是一个明显超过四十字上限的正常叙述句子。", false, ""},
+		{"正常text讨论invoke语法", "这个 bug 会输出 count 或 court,讨论 invoke 语法", false, ""},
+	}
+	for _, c := range cases {
+		got, m := detectSpamTail(c.in)
+		if m != c.matched {
+			t.Errorf("%s: matched=%v want=%v (in=%q)", c.name, m, c.matched, c.in)
+			continue
+		}
+		if m && strings.TrimRight(got, " \n\r\t") != c.want {
+			t.Errorf("%s: narrative=%q want=%q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRescueSpamTailBeforeToolUse 端到端:刷屏尾巴 text block 紧跟真 tool_use → 剥尾、保叙述、透传 tool_use。
+func TestRescueSpamTailBeforeToolUse(t *testing.T) {
+	text := "先看行渲染模板。" + "\n\n" + spamSeg(20)
+	input := strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + jsonStr(text) + `}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_real","name":"Read","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"offset\":273}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+		``,
+		``,
+	}, "\n")
+	out := runRescue(t, input)
+
+	if !strings.Contains(out, "先看行渲染模板") {
+		t.Errorf("正常叙述未保留\n%s", out)
+	}
+	if strings.Contains(out, "court") || strings.Contains(out, "Grep.") {
+		t.Errorf("刷屏尾巴未被剥离\n%s", out)
+	}
+	if !strings.Contains(out, "toolu_real") {
+		t.Errorf("真 tool_use 被误改或丢失\n%s", out)
+	}
+	if !strings.Contains(out, `"stop_reason":"tool_use"`) {
+		t.Errorf("stop_reason 被误改\n%s", out)
+	}
+}
+
+// TestRescueSpamTailNotStrippedWithoutToolUse 防误伤:刷屏尾巴后接 end_turn(无 tool_use)→ 不剥,原样透传。
+func TestRescueSpamTailNotStrippedWithoutToolUse(t *testing.T) {
+	text := "先看行渲染模板。" + "\n\n" + spamSeg(20)
+	input := strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + jsonStr(text) + `}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		``,
+		``,
+	}, "\n")
+	out := runRescue(t, input)
+	if !strings.Contains(out, "先看行渲染模板") {
+		t.Errorf("叙述被误删\n%s", out)
+	}
+	// 后面无 tool_use → 不剥,刷屏原样保留
+	if !strings.Contains(out, "court") {
+		t.Errorf("后接非 tool_use 时不应剥离刷屏尾巴\n%s", out)
+	}
+	if !strings.Contains(out, `"stop_reason":"end_turn"`) {
+		t.Errorf("stop_reason 被误改\n%s", out)
+	}
+}
+
+// TestRescueSpamTailRealSample 多个真样本回归:满屏 court 刷屏被剥,真 tool_use 完整透传。
+// 覆盖三个现场:291(Read 循环)、282(court read anchor)、338(court看 CSS,叙述含 court 需保留一部分)。
+func TestRescueSpamTailRealSample(t *testing.T) {
+	// 退化正例 00552:满屏 court read 刷屏 + 后接真 tool_use(Read),期望剥屏、保叙述、透传工具。
+	out := runRescue(t, readTestdataSSE(t, "20260915-112709-00552.sse"))
+	for _, txt := range textDeltas(out) {
+		if strings.Contains(txt, "\n\ncourt") {
+			t.Errorf("[00552] 刷屏 court text_delta 泄漏: %q", tail(txt, 120))
+		}
+	}
+	if !strings.Contains(out, `"name":"Read"`) {
+		t.Errorf("[00552] 真 tool_use Read 丢失\n%s", tail(out, 600))
+	}
+	if !strings.Contains(out, "atwebpilot 在这个环境彻底不可用") {
+		t.Errorf("[00552] 正常叙述未保留\n%s", tail(out, 600))
+	}
+
+	// 防误伤反例:正常长文本高频提及 "court"/"read"/"grep" 等词但非刷屏(长句、非短祈使),
+	// 且后接真 tool_use。判据不得剥离,叙述须完整保留。
+	narrative := "好方向:court/count 前缀是强退化信号,我打算把判据分成两档来识别刷屏。" +
+		"\n\n先读一遍现有的 rescue 逻辑,再决定 grep 哪些样本来验证阈值是否合理。"
+	input := strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + jsonStr(narrative) + `}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_real2","name":"Edit","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+		``,
+		``,
+	}, "\n")
+	out2 := runRescue(t, input)
+	if !strings.Contains(out2, "先读一遍现有的 rescue 逻辑") {
+		t.Errorf("正常长叙述(含 court/read/grep 词)被误剥\n%s", tail(out2, 600))
+	}
+	if !strings.Contains(out2, "toolu_real2") {
+		t.Errorf("真 tool_use Edit 被误改或丢失\n%s", tail(out2, 600))
+	}
+}
+
+// readTestdataSSE 读入库的 testdata SSE 样本,去掉 # META 首行,返回纯 SSE 体。
+func readTestdataSSE(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile("testdata/" + name)
 	if err != nil {
-		t.Skipf("样本不存在: %v", err)
+		t.Fatalf("读 testdata/%s 失败: %v", name, err)
 	}
-	body := data
-	if i := strings.IndexByte(string(data), '\n'); strings.HasPrefix(string(data), "# META") {
-		body = data[i+1:]
+	if strings.HasPrefix(string(data), "# META") {
+		if i := strings.IndexByte(string(data), '\n'); i >= 0 {
+			return string(data[i+1:])
+		}
 	}
-	out := runRescue(t, string(body))
+	return string(data)
+}
+
+// textDeltas 从救援输出里提取所有 text_delta 的文本片段。
+func textDeltas(out string) []string {
+	var res []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var d map[string]interface{}
+		if json.Unmarshal([]byte(strings.TrimSpace(line[5:])), &d) != nil {
+			continue
+		}
+		if delta, _ := d["delta"].(map[string]interface{}); delta != nil {
+			if txt, ok := delta["text"].(string); ok {
+				res = append(res, txt)
+			}
+		}
+	}
+	return res
+}
+
+// jsonStr 把字符串编码为 JSON 字符串字面量(带引号),用于拼构造样本。
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// 构造坏样本:AskUserQuestion 的 questions 被双重编码(值是被转义的 JSON 字符串而非数组),
+// 救援后应还原成合法数组(input_json_delta 里 questions 是 array)。
+func TestRescueInputFixDoubleEncoded(t *testing.T) {
+	// 双重编码:questions 的值本应是数组,却被编码成一个 JSON 字符串。
+	// 先造出正确的 input JSON({"questions":"<数组的JSON字符串>"}),再把它作为 partial_json 的值
+	// 用 jsonStr 编码进 data 行,避免手写多层转义出错。
+	innerArr := `[{"question":"选哪个?","header":"选择","multiSelect":false,"options":[{"label":"A","description":"甲"},{"label":"B","description":"乙"}]}]`
+	inputJSON, _ := json.Marshal(map[string]interface{}{"questions": innerArr}) // questions 值是字符串 = 双重编码
+	input := strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ask","name":"AskUserQuestion","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":` + jsonStr(string(inputJSON)) + `}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+		``,
+		``,
+	}, "\n")
+	out := runRescue(t, input)
 
 	// 从输出里找 AskUserQuestion 的 input_json_delta,确认 questions 已是数组
 	found := false
