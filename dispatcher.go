@@ -21,10 +21,12 @@ import (
 // 阶段一:current 固定为启动时拉起的单个 backend(不热切换)。
 // 阶段二:磁盘版本更新时起新 backend、原子替换 current、SIGTERM 退休旧 backend。
 
-// backendState 保存一个 backend worker 的地址与 pid。
+// backendState 保存一个 backend worker 的地址、pid、监听端口与版本。
 type backendState struct {
-	target *url.URL
-	pid    int
+	target  *url.URL
+	pid     int
+	port    int
+	version string // 该 backend 进程的 claude-proxy 版本(经 /__claude_proxy/version 探得)
 }
 
 // serveDispatcher 启动 dispatcher:抢对外端口、确保 backend 在跑、转发。
@@ -62,8 +64,11 @@ func serveDispatcher(cfg *Config) {
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
-	log.Printf("[dispatcher] claude-proxy %s listening on http://%s  ->  backend %s (real upstream %s)",
-		version, addr, bs.target, cfg.Upstream)
+	log.Printf("[dispatcher] claude-proxy %s listening on http://%s  ->  backend %s (%s) (real upstream %s)",
+		version, addr, bs.target, bs.version, cfg.Upstream)
+
+	// 阶段二:后台周期自查磁盘版本,新则起新 backend 热切换、退休旧 backend。
+	go runHotSwapLoop(cfg, &current)
 
 	if err := srv.Serve(ln); err != nil {
 		log.Fatalf("[dispatcher] server exited: %v", err)
@@ -124,40 +129,52 @@ func escapeToUpstream(upstream *url.URL, w http.ResponseWriter, r *http.Request)
 	return true
 }
 
-// ensureBackend 确保 backend worker 在内部端口监听:不在则拉起并等就绪。
+// ensureBackend 确保 cfg.BackendPort 上有 backend worker:不在则拉起并等就绪。
+// 启动时用;热切换起新 backend 走 startBackendOn(新端口)。
 func ensureBackend(cfg *Config) (*backendState, error) {
-	target, err := url.Parse(fmt.Sprintf("http://%s:%d", cfg.ListenHost, cfg.BackendPort))
+	if portListening(cfg.ListenHost, cfg.BackendPort) {
+		// 复用已在跑的 backend(探其版本)。
+		target, _ := url.Parse(fmt.Sprintf("http://%s:%d", cfg.ListenHost, cfg.BackendPort))
+		return &backendState{target: target, pid: 0, port: cfg.BackendPort,
+			version: probeBackendVersion(cfg.ListenHost, cfg.BackendPort)}, nil
+	}
+	return startBackendOn(cfg, cfg.BackendPort)
+}
+
+// startBackendOn 在指定端口拉起一个新 backend 并等就绪,返回其 state(含探得的版本)。
+func startBackendOn(cfg *Config, port int) (*backendState, error) {
+	target, err := url.Parse(fmt.Sprintf("http://%s:%d", cfg.ListenHost, port))
 	if err != nil {
 		return nil, err
 	}
-	if backendListening(cfg) {
-		return &backendState{target: target, pid: 0}, nil // 复用已在跑的 backend
-	}
-	pid, err := spawnBackend(cfg, cfg.BackendPort)
+	pid, err := spawnBackend(cfg, port)
 	if err != nil {
 		return nil, err
+	}
+	ready := func() *backendState {
+		return &backendState{target: target, pid: pid, port: port,
+			version: probeBackendVersion(cfg.ListenHost, port)}
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if backendListening(cfg) {
-			return &backendState{target: target, pid: pid}, nil
+		if portListening(cfg.ListenHost, port) {
+			return ready(), nil
 		}
 		if !pidAlive(pid) {
 			time.Sleep(150 * time.Millisecond)
-			if backendListening(cfg) {
-				return &backendState{target: target, pid: pid}, nil
+			if portListening(cfg.ListenHost, port) {
+				return ready(), nil
 			}
-			return nil, fmt.Errorf("backend 启动后立即退出(端口 %d),看 %s", cfg.BackendPort, cfg.LogFile)
+			return nil, fmt.Errorf("backend 启动后立即退出(端口 %d),看 %s", port, cfg.LogFile)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("backend 未能在 5s 内就绪,看 %s", cfg.LogFile)
+	return nil, fmt.Errorf("backend 未能在 5s 内就绪(端口 %d),看 %s", port, cfg.LogFile)
 }
 
-// backendListening 探测 backend 内部端口是否在监听。
-func backendListening(cfg *Config) bool {
-	addr := fmt.Sprintf("%s:%d", cfg.ListenHost, cfg.BackendPort)
-	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+// portListening 探测某回环端口是否在监听。
+func portListening(host string, port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 500*time.Millisecond)
 	if err != nil {
 		return false
 	}
