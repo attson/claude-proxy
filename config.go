@@ -15,6 +15,12 @@ type Config struct {
 	ListenHost string
 	Port       int
 
+	// 两层架构:dispatcher 监听对外 Port(默认 36240),把请求转发给 backend
+	// worker 监听的内部端口 BackendPort(默认 Port+1000,回环)。BackendPort<=0
+	// 或与 Port 相同则退化为单层(不启用两层,兼容/回退)。
+	// backend 进程由 dispatcher 用 env CLAUDE_PROXY_BACKEND_PORT 指定其监听端口。
+	BackendPort int
+
 	// 真实上游 base URL(完整,含 scheme,可含端口/路径前缀)。
 	// 来源优先级:环境变量 CLAUDE_PROXY_UPSTREAM > run 从 ~/.claude/settings.json
 	// 读到的 ANTHROPIC_BASE_URL > 默认 https://api.anthropic.com。
@@ -46,6 +52,7 @@ func loadConfig() *Config {
 	return &Config{
 		ListenHost:      "127.0.0.1",
 		Port:            port,
+		BackendPort:     envInt("CLAUDE_PROXY_BACKEND_PORT", port+1000),
 		Upstream:        envStr("CLAUDE_PROXY_UPSTREAM", "https://api.anthropic.com"),
 		PassthroughOnly: envBool("CLAUDE_PROXY_PASSTHROUGH", false),
 		SampleEnabled:   envBool("CLAUDE_PROXY_SAMPLE", true),
