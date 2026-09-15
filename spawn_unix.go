@@ -25,3 +25,8 @@ func pidAlive(pid int) bool {
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
 }
+
+// terminateProcess 向进程发 SIGTERM,触发其优雅退出(srv.Shutdown 排空在飞请求)。
+func terminateProcess(pid int) error {
+	return syscall.Kill(pid, syscall.SIGTERM)
+}

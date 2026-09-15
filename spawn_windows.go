@@ -27,3 +27,14 @@ func pidAlive(pid int) bool {
 	_ = proc.Release()
 	return true
 }
+
+// terminateProcess:Windows 无 SIGTERM 优雅投递,降级为 Kill(硬杀)。
+// backend 被硬杀时其在飞请求会被切断——Windows 为次要平台,可接受;
+// 主平台(Unix)走 SIGTERM 优雅排空。
+func terminateProcess(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Kill()
+}
